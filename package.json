@@ -1,0 +1,25 @@
+{
+  "name": "readlater",
+  "version": "0.1.0",
+  "description": "A self-hosted read-later inbox with semantic capture, highlighting, comments, translation, and AI digests.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/echoechoher/readlater-open-source.git"
+  },
+  "homepage": "https://github.com/echoechoher/readlater-open-source#readme",
+  "bugs": {
+    "url": "https://github.com/echoechoher/readlater-open-source/issues"
+  },
+  "type": "module",
+  "packageManager": "pnpm@10.28.1",
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env server.mjs",
+    "start": "node --env-file-if-exists=.env server.mjs",
+    "worker": "node --env-file-if-exists=.env scripts/readlater-worker.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "linkedom": "0.18.12"
+  }
+}

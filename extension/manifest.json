@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Readlater",
+  "version": "0.2.0",
+  "description": "把当前页面保存到 Readlater 收件箱。",
+  "permissions": ["activeTab", "scripting", "storage", "tabs"],
+  "host_permissions": [
+    "http://127.0.0.1:3000/*",
+    "http://localhost:3000/*",
+    "https://*/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Readlater"
+  }
+}
