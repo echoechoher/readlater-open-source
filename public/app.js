@@ -66,6 +66,8 @@ const state = {
   notionSaving: false,
   status: "",
   importUrlDraft: "",
+  importDialogOpen: false,
+  importStatus: "",
   aiProvider: savedAiProvider(),
   authRequired: false,
   authenticated: true
@@ -744,7 +746,7 @@ async function importUrl(event) {
   const url = input.value.trim();
   if (!url) return;
   state.loading = true;
-  state.status = "正在解析链接...";
+  state.importStatus = "正在识别链接并导入...";
   render();
   try {
     const data = await api("/api/inbox/url", {
@@ -752,18 +754,69 @@ async function importUrl(event) {
       body: JSON.stringify({ url, source: "paste_url" })
     });
     state.importUrlDraft = "";
-    state.status = data.duplicate
+    state.importStatus = data.duplicate
       ? "已经保存过了。"
       : (data.article.contentType === "podcast_episode" ? "播客已导入，正在等待转写。" : "已保存到收件箱。");
     await loadArticles();
     await loadArticle(data.article.id);
+    state.importDialogOpen = false;
+    state.importStatus = "";
   } catch (error) {
-    state.status = errorMessage(error);
+    state.importStatus = errorMessage(error);
     render();
   } finally {
     state.loading = false;
     render();
   }
+}
+
+function openImportDialog() {
+  state.importDialogOpen = true;
+  state.importStatus = "";
+  render();
+  const input = document.querySelector("#import-url-input");
+  input?.focus();
+  input?.setSelectionRange(input.value.length, input.value.length);
+}
+
+function closeImportDialog() {
+  if (state.loading) return;
+  state.importDialogOpen = false;
+  state.importStatus = "";
+  render();
+}
+
+function renderImportDialog() {
+  if (!state.importDialogOpen) return "";
+  return `
+    <div class="dialog-backdrop" data-close-import-dialog>
+      <section class="import-dialog" role="dialog" aria-modal="true" aria-labelledby="import-dialog-title">
+        <div class="import-dialog-header">
+          <div>
+            <h2 id="import-dialog-title">导入到 Inbox</h2>
+            <p>粘贴文章或播客链接，系统会自动识别内容类型。</p>
+          </div>
+          <button class="dialog-close" type="button" data-close-import-dialog aria-label="关闭导入弹窗" title="关闭" ${state.loading ? "disabled" : ""}>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg>
+          </button>
+        </div>
+        <form class="import-dialog-form" id="import-url-form">
+          <label for="import-url-input">链接</label>
+          <input id="import-url-input" type="url" inputmode="url" autocomplete="off" aria-describedby="import-url-help" placeholder="https://example.com/article-or-podcast" value="${escapeHtml(state.importUrlDraft)}" required ${state.loading ? "disabled" : ""} />
+          <div class="import-url-help" id="import-url-help">
+            <span>文章</span>
+            <span>播客</span>
+            <span>音频直链</span>
+          </div>
+          ${state.importStatus ? `<div class="import-dialog-status" role="status" aria-live="polite">${escapeHtml(state.importStatus)}</div>` : ""}
+          <div class="import-dialog-actions">
+            <button type="button" data-close-import-dialog ${state.loading ? "disabled" : ""}>取消</button>
+            <button class="primary" type="submit" ${state.loading ? "disabled" : ""}>${state.loading ? "正在导入..." : "导入"}</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  `;
 }
 
 function hasActiveTranscription(article) {
@@ -2027,14 +2080,13 @@ function render() {
         <div class="brand">
           <button class="list-tab ${state.listMode !== "archive" && state.listMode !== "setup" ? "active" : ""}" type="button" data-list-mode="inbox">Inbox</button>
           <button class="list-tab ${state.listMode === "archive" ? "active" : ""}" type="button" data-list-mode="archive">Archive</button>
+          ${state.listMode === "inbox" ? `
+            <button class="inbox-add-button" id="open-import-dialog" type="button" aria-label="导入文章或播客" title="导入文章或播客">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>
+            </button>
+          ` : ""}
         </div>
-        ${state.listMode === "inbox" ? `
-          <form class="sidebar-import-form" id="import-url-form">
-            <input id="import-url-input" type="url" inputmode="url" autocomplete="off" aria-label="导入链接" placeholder="粘贴文章、播客或音频链接" value="${escapeHtml(state.importUrlDraft)}" required />
-            <button type="submit" aria-label="导入链接" title="导入链接" ${state.loading ? "disabled" : ""}>导入</button>
-          </form>
-          ${state.status ? `<div class="sidebar-import-status" role="status" aria-live="polite">${escapeHtml(state.status)}</div>` : ""}
-        ` : ""}
+        ${state.listMode === "inbox" && state.status ? `<div class="sidebar-status" role="status" aria-live="polite">${escapeHtml(state.status)}</div>` : ""}
         <div class="article-list">${renderArticleList()}</div>
         <div class="sidebar-footer">
           <div class="archive-entry" id="toggle-setup">${state.listMode === "setup" ? "Inbox" : "Setup"}</div>
@@ -2045,6 +2097,7 @@ function render() {
         ${renderReader()}
         ${renderSidePanel()}
       </div>
+      ${renderImportDialog()}
     </div>
   `;
   app.dataset.currentListMode = state.listMode;
@@ -2062,6 +2115,13 @@ function render() {
   document.querySelector("#import-url-form")?.addEventListener("submit", importUrl);
   document.querySelector("#import-url-input")?.addEventListener("input", (event) => {
     state.importUrlDraft = event.currentTarget.value;
+  });
+  document.querySelector("#open-import-dialog")?.addEventListener("click", openImportDialog);
+  document.querySelectorAll("[data-close-import-dialog]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      if (event.currentTarget !== event.target && event.currentTarget.classList.contains("dialog-backdrop")) return;
+      closeImportDialog();
+    });
   });
   document.querySelector("[data-delete-article-id]")?.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -2113,7 +2173,12 @@ document.addEventListener("click", closeArticleMenu);
 document.addEventListener("mouseup", handleDocumentMouseUp, true);
 document.addEventListener("copy", handleDocumentCopy);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeArticleMenu();
+  if (event.key !== "Escape") return;
+  if (state.importDialogOpen) {
+    closeImportDialog();
+    return;
+  }
+  closeArticleMenu();
 });
 window.addEventListener("resize", () => {
   if (!window.matchMedia?.("(max-width: 1080px)").matches) setSidePanelWidth(state.sidePanelWidth);
