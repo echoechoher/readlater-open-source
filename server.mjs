@@ -49,9 +49,11 @@ const host = process.env.HOST || "127.0.0.1";
 const publicBaseUrl = process.env.PUBLIC_BASE_URL || "";
 const appPassword = process.env.READLATER_PASSWORD || "";
 const sessionSecret = process.env.READLATER_SESSION_SECRET || appPassword || createToken();
-const translationApiKey = process.env.TRANSLATION_API_KEY || "";
-const translationApiUrl = process.env.TRANSLATION_API_URL || "https://api.openai.com/v1/chat/completions";
-const translationModel = process.env.TRANSLATION_MODEL || "gpt-4o-mini";
+const translationApiKey = process.env.TRANSLATION_API_KEY || process.env.TENCENT_TRANSLATION_API_KEY || "";
+const translationApiUrl = process.env.TRANSLATION_API_URL
+  || process.env.TENCENT_TRANSLATION_API_URL
+  || "https://api.openai.com/v1/chat/completions";
+const translationModel = process.env.TRANSLATION_MODEL || process.env.TENCENT_TRANSLATION_MODEL || "gpt-4o-mini";
 const notionTokenFromEnv = process.env.NOTION_TOKEN || "";
 const notionParentPageIdFromEnv = process.env.NOTION_PARENT_PAGE_ID || "";
 const sessionMaxAgeSeconds = 60 * 60 * 24 * 30;
