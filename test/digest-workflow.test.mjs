@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import {
   buildDigestPrompt,
   buildDigestSystemPrompt,
+  buildDigestMapPrompt,
   buildNotionRoutingSystemPrompt,
   buildNotionRoutingPrompt,
   createDigestInputSnapshot,
+  contentAroundHighlights,
   digestModeInstruction,
   formatDigestConversation,
   formatNotionConversation,
@@ -26,6 +28,37 @@ test("digest input snapshot stays immutable when article messages change", () =>
 
   assert.equal(snapshot.highlights[0].note, "first note");
   assert.deepEqual(snapshot.aiMessages, [{ role: "assistant", content: "existing answer" }]);
+});
+
+test("podcast digest snapshot keeps content type and transcript version", () => {
+  const snapshot = createDigestInputSnapshot({
+    contentType: "podcast_episode",
+    transcription: { transcriptVersion: 3 },
+    contentText: "播客文稿"
+  });
+  assert.equal(snapshot.contentType, "podcast_episode");
+  assert.equal(snapshot.transcriptVersion, 3);
+});
+
+test("highlight-focused podcast digest only selects merged nearby context", () => {
+  const content = `${"A".repeat(20)}target-one${"B".repeat(20)}target-two${"C".repeat(20)}`;
+  const selected = contentAroundHighlights({
+    contentText: content,
+    highlights: [
+      { textStart: 20, textEnd: 30 },
+      { textStart: 50, textEnd: 60 }
+    ]
+  }, 15);
+  assert.match(selected, /target-one/);
+  assert.match(selected, /target-two/);
+  assert.doesNotMatch(selected, /^A{20}/);
+});
+
+test("podcast map prompt identifies chunk order and forbids invention", () => {
+  const prompt = buildDigestMapPrompt("chunk text", 1, 4);
+  assert.match(prompt, /第 2\/4 部分/);
+  assert.match(prompt, /不要添加原文没有的信息/);
+  assert.match(prompt, /<transcript_chunk>\nchunk text/);
 });
 
 test("digest system contains the skill while user prompt contains runtime context", () => {

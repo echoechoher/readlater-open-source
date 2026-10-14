@@ -17,9 +17,12 @@
     "dev": "node --env-file-if-exists=.env server.mjs",
     "start": "node --env-file-if-exists=.env server.mjs",
     "worker": "node --env-file-if-exists=.env scripts/readlater-worker.mjs",
+    "smoke:tingwu": "node --env-file-if-exists=.env scripts/tingwu-smoke.mjs",
     "test": "node --test"
   },
   "dependencies": {
+    "@alicloud/openapi-client": "0.4.15",
+    "@alicloud/tingwu20230930": "2.0.26",
     "linkedom": "0.18.12"
   }
 }

@@ -62,8 +62,10 @@ const state = {
   showTranslation: false,
   loading: false,
   polling: false,
+  transcriptionPolling: false,
   notionSaving: false,
   status: "",
+  importUrlDraft: "",
   aiProvider: savedAiProvider(),
   authRequired: false,
   authenticated: true
@@ -448,8 +450,19 @@ function formatPublishedDate(value) {
 }
 
 function readingTime(article) {
+  if (article?.contentType === "podcast_episode" && article.podcast?.durationSeconds) {
+    return `${formatDuration(article.podcast.durationSeconds)} 播客`;
+  }
   const length = (article?.contentText || "").replace(/\s+/g, "").length;
   return length ? `${Math.max(1, Math.ceil(length / 500))} 分钟阅读` : "";
+}
+
+function formatDuration(totalSeconds = 0) {
+  const seconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours) return `${hours} 小时 ${minutes} 分钟`;
+  return `${Math.max(1, minutes)} 分钟`;
 }
 
 function renderReaderMeta(article) {
@@ -474,6 +487,7 @@ function errorMessage(error) {
 }
 
 function sourceType(article = {}) {
+  if (article.contentType === "podcast_episode") return "podcast";
   const value = [
     article.siteName,
     article.source,
@@ -488,7 +502,7 @@ function sourceType(article = {}) {
 
 function sourceIcon(article) {
   const type = sourceType(article);
-  const label = { wechat: "微信公众号", x: "X", jike: "即刻", web: "网页" }[type];
+  const label = { podcast: "播客", wechat: "微信公众号", x: "X", jike: "即刻", web: "网页" }[type];
   return `<span class="source-icon ${type}" title="${label}" aria-label="${label}"></span>`;
 }
 
@@ -730,15 +744,17 @@ async function importUrl(event) {
   const url = input.value.trim();
   if (!url) return;
   state.loading = true;
-  state.status = "正在抓取文章...";
+  state.status = "正在解析链接...";
   render();
   try {
     const data = await api("/api/inbox/url", {
       method: "POST",
       body: JSON.stringify({ url, source: "paste_url" })
     });
-    input.value = "";
-    state.status = data.duplicate ? "已经保存过了。" : "已保存到收件箱。";
+    state.importUrlDraft = "";
+    state.status = data.duplicate
+      ? "已经保存过了。"
+      : (data.article.contentType === "podcast_episode" ? "播客已导入，正在等待转写。" : "已保存到收件箱。");
     await loadArticles();
     await loadArticle(data.article.id);
   } catch (error) {
@@ -747,6 +763,67 @@ async function importUrl(event) {
   } finally {
     state.loading = false;
     render();
+  }
+}
+
+function hasActiveTranscription(article) {
+  return article?.contentType === "podcast_episode"
+    && ["queued", "processing"].includes(article.transcription?.status);
+}
+
+async function pollTranscriptions() {
+  if (state.transcriptionPolling || !state.articles.some(hasActiveTranscription)) return;
+  state.transcriptionPolling = true;
+  try {
+    const data = await api("/api/articles");
+    state.articles = data.articles;
+    if (state.activeArticle && hasActiveTranscription(state.activeArticle)) {
+      const updated = await api(`/api/articles/${state.activeArticle.id}`);
+      state.activeArticle = updated.article;
+    }
+    renderPreservingReaderScroll();
+  } catch {
+    // Status polling is best-effort.
+  } finally {
+    state.transcriptionPolling = false;
+  }
+}
+
+async function retryTranscription() {
+  if (!state.activeArticle || state.loading) return;
+  state.loading = true;
+  try {
+    const data = await api(`/api/articles/${state.activeArticle.id}/transcription/retry`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    state.activeArticle = { ...state.activeArticle, ...data.article };
+    state.articles = state.articles.map((article) => article.id === data.article.id ? { ...article, ...data.article } : article);
+    state.status = "已重新加入转写队列。";
+  } catch (error) {
+    state.status = errorMessage(error);
+  } finally {
+    state.loading = false;
+    renderPreservingReaderScroll();
+  }
+}
+
+async function cancelTranscription() {
+  if (!state.activeArticle || state.loading) return;
+  state.loading = true;
+  try {
+    const data = await api(`/api/articles/${state.activeArticle.id}/transcription/cancel`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    state.activeArticle = { ...state.activeArticle, ...data.article };
+    state.articles = state.articles.map((article) => article.id === data.article.id ? { ...article, ...data.article } : article);
+    state.status = "已取消转写。";
+  } catch (error) {
+    state.status = errorMessage(error);
+  } finally {
+    state.loading = false;
+    renderPreservingReaderScroll();
   }
 }
 
@@ -1306,6 +1383,8 @@ function renderAiMessages(article) {
 function renderAiPanel(article) {
   if (!article) return "";
   const running = hasRunningDigestJob(article);
+  const waitingForTranscript = article.contentType === "podcast_episode" && article.transcription?.status !== "completed";
+  const disabled = running || waitingForTranscript;
   const latestNotionSync = [...(article.notionSyncs || [])]
     .filter((sync) => sync.status === "done")
     .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0] || null;
@@ -1318,7 +1397,7 @@ function renderAiPanel(article) {
       type="button"
       data-ai-provider="${value}"
       aria-pressed="${state.aiProvider === value ? "true" : "false"}"
-      ${running ? "disabled" : ""}
+      ${disabled ? "disabled" : ""}
     >${escapeHtml(label)}</button>
   `).join("");
   return `
@@ -1327,11 +1406,12 @@ function renderAiPanel(article) {
         ${providerOptions}
       </div>
       <div class="ai-actions">
-        ${DIGEST_ACTIONS.map((action) => `<button class="ai-action-button" type="button" data-digest-mode="${action.mode}" data-tooltip="${escapeHtml(action.tooltip)}" data-instruction="${escapeHtml(action.instruction)}" title="${escapeHtml(action.tooltip)}" aria-label="${escapeHtml(action.tooltip)}" ${running ? "disabled" : ""}>${action.label}</button>`).join("")}
+        ${DIGEST_ACTIONS.map((action) => `<button class="ai-action-button" type="button" data-digest-mode="${action.mode}" data-tooltip="${escapeHtml(waitingForTranscript ? "播客转写完成后可用" : action.tooltip)}" data-instruction="${escapeHtml(action.instruction)}" title="${escapeHtml(waitingForTranscript ? "播客转写完成后可用" : action.tooltip)}" aria-label="${escapeHtml(action.tooltip)}" ${disabled ? "disabled" : ""}>${action.label}</button>`).join("")}
       </div>
+      ${waitingForTranscript ? `<div class="transcription-ai-notice">播客转写完成后可以开始 Digest。</div>` : ""}
       ${renderAiMessages(article)}
       ${notionState}
-      <textarea id="ai-input" class="ai-input" placeholder="继续围绕本文讨论" ${running ? "disabled" : ""}></textarea>
+      <textarea id="ai-input" class="ai-input" placeholder="${waitingForTranscript ? "等待播客转写完成" : "继续围绕本文讨论"}" ${disabled ? "disabled" : ""}></textarea>
     </section>
   `;
 }
@@ -1353,10 +1433,55 @@ function renderArticleList() {
       <div class="article-meta">
         ${sourceIcon(article)}
         <span>${formatDate(article.createdAt)}</span>
+        ${article.contentType === "podcast_episode" && article.transcription?.status !== "completed" ? `<span class="transcription-list-state ${escapeHtml(article.transcription?.status || "queued")}">${escapeHtml({
+          queued: "等待转写",
+          processing: "转写中",
+          failed: "转写失败",
+          cancelled: "已取消",
+          not_configured: "待配置"
+        }[article.transcription?.status] || "等待转写")}</span>` : ""}
         ${article.fetchStatus === "failed" ? `<span class="status-icon failed" title="抓取失败" aria-label="抓取失败"></span>` : ""}
       </div>
     </div>
   `).join("") + menu;
+}
+
+function renderPodcastHeader(article) {
+  if (article.contentType !== "podcast_episode") return "";
+  const podcast = article.podcast || {};
+  return `
+    <div class="podcast-header">
+      ${podcast.coverUrl ? `<img src="${escapeHtml(podcast.coverUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" />` : `<div class="podcast-cover-placeholder" aria-hidden="true">◉</div>`}
+      <div>
+        <div class="podcast-show">${escapeHtml(podcast.showName || article.siteName || "播客")}</div>
+        ${podcast.durationSeconds ? `<div class="podcast-duration">${escapeHtml(formatDuration(podcast.durationSeconds))}</div>` : ""}
+        ${podcast.description ? `<div class="podcast-description">${escapeHtml(podcast.description)}</div>` : ""}
+        ${article.transcription?.status === "completed" ? `<div class="podcast-actions"><button class="text-action" id="retry-transcription" type="button" ${state.loading ? "disabled" : ""}>重新转写并识别说话人</button></div>` : ""}
+      </div>
+    </div>
+  `;
+}
+
+function renderTranscriptionNotice(article) {
+  if (article.contentType !== "podcast_episode" || article.transcription?.status === "completed") return "";
+  const status = article.transcription?.status || "queued";
+  const copy = {
+    queued: ["等待转写", "任务已加入队列，Worker 启动后会自动处理。"],
+    processing: ["正在转写", "长音频可能需要几分钟，完成后文稿会自动出现在这里。"],
+    failed: ["转写失败", article.transcription?.error || "可以检查配置后重新尝试。"],
+    cancelled: ["转写已取消", "需要时可以重新开始。"],
+    not_configured: ["尚未配置转写服务", "请在服务端配置通义听悟凭证，然后重新开始。"]
+  }[status] || ["等待转写", "文稿准备中。"];
+  const retryable = ["failed", "cancelled", "not_configured"].includes(status);
+  const cancellable = ["queued", "processing"].includes(status);
+  return `
+    <div class="transcription-notice ${escapeHtml(status)}">
+      ${["queued", "processing"].includes(status) ? `<span class="loading-dot" aria-hidden="true"></span>` : ""}
+      <div><strong>${escapeHtml(copy[0])}</strong><span>${escapeHtml(copy[1])}</span></div>
+      ${retryable ? `<button class="text-action" id="retry-transcription" type="button" ${state.loading ? "disabled" : ""}>重新转写</button>` : ""}
+      ${cancellable ? `<button class="text-action" id="cancel-transcription" type="button" ${state.loading ? "disabled" : ""}>取消</button>` : ""}
+    </div>
+  `;
 }
 
 function renderReader() {
@@ -1390,8 +1515,10 @@ function renderReader() {
       <div class="article">
         <h1 class="reader-title">${escapeHtml(article.title || article.url)}</h1>
         ${renderReaderMeta(article)}
+        ${renderPodcastHeader(article)}
+        ${renderTranscriptionNotice(article)}
         ${fetchNotice}
-        <article class="content ${article.contentMarkdown ? "structured-content" : "plain-content"}">${content}</article>
+        <article class="content ${article.contentMarkdown ? "structured-content" : "plain-content"}">${article.contentType === "podcast_episode" && article.transcription?.status !== "completed" ? "" : content}</article>
       </div>
     </main>
   `;
@@ -1475,6 +1602,7 @@ function renderSettings() {
   const shortcutBody = `{"url":"快捷指令输入","note":""}`;
   const shortcutName = "存到 Readlater";
   const notion = settings?.notion || {};
+  const transcription = settings?.transcription || {};
   const destinationByKey = new Map((notion.destinations || []).map((item) => [item.key, item]));
   const curlExample = `curl -X POST ${endpoint} \\
   -H "Authorization: Bearer ${token}" \\
@@ -1535,6 +1663,14 @@ function renderSettings() {
             <li>如果返回 401，检查 Authorization 是否是完整的 <code>Bearer token</code>。</li>
             <li>如果没有出现在 Inbox，检查请求体里的 <code>url</code> 是否是蓝色变量“快捷指令输入”。</li>
           </ol>
+        </section>
+        <section class="settings-section">
+          <h3>播客转写</h3>
+          <p>支持小宇宙单集链接和公开 MP3、M4A、AAC、WAV、FLAC、OGG、OPUS 音频直链。导入后由本地 Worker 调用通义听悟，自动识别说话人，并生成可阅读、划线和 Digest 的分段文稿。</p>
+          <div class="transcription-setup-state ${transcription.enabled ? "configured" : "missing"}">
+            ${transcription.enabled ? "播客转写任务已启用" : "播客转写已禁用"}
+          </div>
+          <p>在运行 Worker 的环境中设置 <code>TINGWU_ACCESS_KEY_ID</code>、<code>TINGWU_ACCESS_KEY_SECRET</code> 和 <code>TINGWU_APP_KEY</code>，也可以通过 <code>TINGWU_CREDENTIALS_FILE</code> 复用另一个本地服务的环境文件；凭证不需要交给 Web 服务。默认最大音频时长为 ${escapeHtml(formatDuration(transcription.maxDurationSeconds || 10800))}。</p>
         </section>
         <section class="settings-section" id="notion-settings">
           <h3>Notion 同步</h3>
@@ -1633,6 +1769,8 @@ function renderArticleView() {
   main.innerHTML = `${renderMainTopbar()}${renderReader()}${renderSidePanel()}`;
   document.querySelector("#archive-active-article")?.addEventListener("click", toggleArchiveActiveArticle);
   document.querySelector("#refetch-active-article")?.addEventListener("click", refetchActiveArticle);
+  document.querySelector("#retry-transcription")?.addEventListener("click", retryTranscription);
+  document.querySelector("#cancel-transcription")?.addEventListener("click", cancelTranscription);
   document.querySelector(".main-topbar")?.addEventListener("wheel", handleTopbarWheel, { passive: false });
   document.querySelector(".reader")?.addEventListener("scroll", handleReaderScroll, { passive: true });
   bindSidePanelHandlers();
@@ -1890,6 +2028,13 @@ function render() {
           <button class="list-tab ${state.listMode !== "archive" && state.listMode !== "setup" ? "active" : ""}" type="button" data-list-mode="inbox">Inbox</button>
           <button class="list-tab ${state.listMode === "archive" ? "active" : ""}" type="button" data-list-mode="archive">Archive</button>
         </div>
+        ${state.listMode === "inbox" ? `
+          <form class="sidebar-import-form" id="import-url-form">
+            <input id="import-url-input" type="url" inputmode="url" autocomplete="off" aria-label="导入链接" placeholder="粘贴文章、播客或音频链接" value="${escapeHtml(state.importUrlDraft)}" required />
+            <button type="submit" aria-label="导入链接" title="导入链接" ${state.loading ? "disabled" : ""}>导入</button>
+          </form>
+          ${state.status ? `<div class="sidebar-import-status" role="status" aria-live="polite">${escapeHtml(state.status)}</div>` : ""}
+        ` : ""}
         <div class="article-list">${renderArticleList()}</div>
         <div class="sidebar-footer">
           <div class="archive-entry" id="toggle-setup">${state.listMode === "setup" ? "Inbox" : "Setup"}</div>
@@ -1913,6 +2058,10 @@ function render() {
   document.querySelectorAll("[data-article-id]").forEach((node) => {
     node.addEventListener("click", () => loadArticle(node.dataset.articleId));
     node.addEventListener("contextmenu", (event) => openArticleMenu(event, node.dataset.articleId));
+  });
+  document.querySelector("#import-url-form")?.addEventListener("submit", importUrl);
+  document.querySelector("#import-url-input")?.addEventListener("input", (event) => {
+    state.importUrlDraft = event.currentTarget.value;
   });
   document.querySelector("[data-delete-article-id]")?.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -1940,6 +2089,8 @@ function render() {
   });
   document.querySelector("#archive-active-article")?.addEventListener("click", toggleArchiveActiveArticle);
   document.querySelector("#refetch-active-article")?.addEventListener("click", refetchActiveArticle);
+  document.querySelector("#retry-transcription")?.addEventListener("click", retryTranscription);
+  document.querySelector("#cancel-transcription")?.addEventListener("click", cancelTranscription);
   document.querySelector(".main-topbar")?.addEventListener("wheel", handleTopbarWheel, { passive: false });
   document.querySelector(".reader")?.addEventListener("scroll", handleReaderScroll, { passive: true });
   bindSidePanelHandlers();
@@ -1968,6 +2119,7 @@ window.addEventListener("resize", () => {
   if (!window.matchMedia?.("(max-width: 1080px)").matches) setSidePanelWidth(state.sidePanelWidth);
 });
 setInterval(pollDigestJobs, 5000);
+setInterval(pollTranscriptions, 5000);
 
 loadSession()
   .then(() => {

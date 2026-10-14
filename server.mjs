@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,11 +27,22 @@ import {
   normalizeNotionPageId,
   validateNotionConnection
 } from "./lib/notion-sync.mjs";
+import {
+  isSupportedPodcastUrl,
+  resolvePodcastUrl
+} from "./lib/podcast.mjs";
+import {
+  claimNextTranscriptionJob,
+  sanitizeTranscriptSegments,
+  transcriptToDocument
+} from "./lib/transcription.mjs";
+import { isTingwuConfigured } from "./lib/tingwu.mjs";
 
 const rootDir = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(rootDir, "public");
 const dataDir = process.env.READLATER_DATA_DIR ? resolve(process.env.READLATER_DATA_DIR) : join(rootDir, "data");
 const mediaDir = join(dataDir, "media");
+const transcriptDir = join(dataDir, "transcripts");
 const dbPath = join(dataDir, "readlater.json");
 const port = Number(process.env.PORT || 3000);
 const host = process.env.HOST || "127.0.0.1";
@@ -45,6 +56,10 @@ const notionTokenFromEnv = process.env.NOTION_TOKEN || "";
 const notionParentPageIdFromEnv = process.env.NOTION_PARENT_PAGE_ID || "";
 const sessionMaxAgeSeconds = 60 * 60 * 24 * 30;
 const browserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36";
+const transcriptionProvider = String(process.env.TRANSCRIPTION_PROVIDER || "tingwu").toLowerCase();
+const transcriptionEnabled = transcriptionProvider === "tingwu";
+const transcriptionMaxDurationSeconds = Math.max(60, Number(process.env.TRANSCRIPTION_MAX_DURATION_SECONDS || 10800));
+const transcriptionLeaseMs = Math.max(30000, Number(process.env.TRANSCRIPTION_LEASE_MS || 120000));
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -63,14 +78,19 @@ const mimeTypes = {
 
 async function ensureDb() {
   await mkdir(dataDir, { recursive: true });
+  await mkdir(transcriptDir, { recursive: true });
   if (!existsSync(dbPath)) {
-    await writeFile(dbPath, JSON.stringify({ articles: [], inboxItems: [], digestJobs: [], settings: defaultSettings() }, null, 2));
+    await atomicWriteFile(dbPath, JSON.stringify({ articles: [], inboxItems: [], digestJobs: [], transcriptionJobs: [], settings: defaultSettings() }, null, 2));
     return;
   }
   const db = JSON.parse(await readFile(dbPath, "utf8"));
   let changed = false;
   if (!Array.isArray(db.digestJobs)) {
     db.digestJobs = [];
+    changed = true;
+  }
+  if (!Array.isArray(db.transcriptionJobs)) {
+    db.transcriptionJobs = [];
     changed = true;
   }
   if (!db.settings) {
@@ -94,6 +114,10 @@ async function ensureDb() {
     changed = true;
   }
   for (const article of db.articles || []) {
+    if (!article.contentType) {
+      article.contentType = "article";
+      changed = true;
+    }
     if (!Array.isArray(article.aiMessages)) {
       article.aiMessages = [];
       changed = true;
@@ -104,11 +128,17 @@ async function ensureDb() {
     }
   }
   if (changed) {
-    await writeFile(dbPath, JSON.stringify(db, null, 2));
+    await atomicWriteFile(dbPath, JSON.stringify(db, null, 2));
   }
 }
 
 let dbCache = null;
+
+async function atomicWriteFile(path, content) {
+  const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporaryPath, content);
+  await rename(temporaryPath, path);
+}
 
 async function readDb() {
   if (dbCache) return JSON.parse(JSON.stringify(dbCache));
@@ -119,8 +149,23 @@ async function readDb() {
 
 async function writeDb(db) {
   await ensureDb();
-  dbCache = db;
-  await writeFile(dbPath, JSON.stringify(db, null, 2));
+  const snapshot = JSON.parse(JSON.stringify(db));
+  await atomicWriteFile(dbPath, JSON.stringify(snapshot, null, 2));
+  dbCache = snapshot;
+}
+
+let mutationTail = Promise.resolve();
+
+async function withMutationLock(task) {
+  const previous = mutationTail;
+  let release;
+  mutationTail = new Promise((resolveLock) => { release = resolveLock; });
+  await previous;
+  try {
+    return await task();
+  } finally {
+    release();
+  }
 }
 
 function now() {
@@ -770,6 +815,13 @@ async function extractFromUrl(url) {
 }
 
 function articleSummary(article) {
+  const podcast = article.podcast ? {
+    platform: article.podcast.platform,
+    showName: article.podcast.showName,
+    title: article.podcast.title,
+    coverUrl: article.podcast.coverUrl,
+    durationSeconds: article.podcast.durationSeconds
+  } : null;
   return {
     id: article.id,
     url: article.url,
@@ -777,12 +829,84 @@ function articleSummary(article) {
     siteName: article.siteName,
     author: article.author,
     source: article.source,
+    contentType: article.contentType || "article",
+    podcast,
+    transcription: article.transcription || null,
     fetchStatus: article.fetchStatus,
     readingStatus: article.readingStatus,
     excerpt: article.excerpt,
     createdAt: article.createdAt,
     updatedAt: article.updatedAt
   };
+}
+
+function transcriptionSettingsForClient() {
+  return {
+    provider: transcriptionProvider,
+    enabled: transcriptionEnabled,
+    serverCredentialsDetected: isTingwuConfigured(),
+    maxDurationSeconds: transcriptionMaxDurationSeconds
+  };
+}
+
+function transcriptPath(articleId, version) {
+  return join(transcriptDir, articleId, `${version}.json`);
+}
+
+async function writeTranscript(articleId, version, payload) {
+  const directory = join(transcriptDir, articleId);
+  await mkdir(directory, { recursive: true });
+  const path = transcriptPath(articleId, version);
+  await atomicWriteFile(path, JSON.stringify(payload));
+  return `transcripts/${articleId}/${version}.json`;
+}
+
+async function readTranscript(article) {
+  const relativePath = article?.transcription?.transcriptPath;
+  if (!relativePath || !relativePath.startsWith(`transcripts/${article.id}/`)) return null;
+  try {
+    return JSON.parse(await readFile(join(dataDir, relativePath), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function queueTranscriptionJob(db, article, { force = false } = {}) {
+  db.transcriptionJobs ||= [];
+  const active = db.transcriptionJobs.find((job) => (
+    job.articleId === article.id && ["queued", "waiting", "running"].includes(job.status)
+  ));
+  if (active && !force) return active;
+  const timestamp = now();
+  const job = {
+    id: id("transcription"),
+    articleId: article.id,
+    provider: "tingwu",
+    stage: "submit",
+    status: "queued",
+    audioUrl: article.podcast?.audioUrl || "",
+    providerTaskId: "",
+    attempts: 0,
+    errorAttempts: 0,
+    nextRunAt: timestamp,
+    workerId: "",
+    leaseExpiresAt: "",
+    error: "",
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+  db.transcriptionJobs.push(job);
+  article.transcription = {
+    ...(article.transcription || {}),
+    status: "queued",
+    provider: "tingwu",
+    providerTaskId: "",
+    error: "",
+    requestedAt: timestamp,
+    updatedAt: timestamp
+  };
+  article.updatedAt = timestamp;
+  return job;
 }
 
 function isWorkerAuthorized(req, db) {
@@ -932,7 +1056,77 @@ function normalizeDigestProvider() {
   return "openai_compatible";
 }
 
+async function createPodcastArticleFromUrl({ url, source = "paste_url", quickNote = "" }) {
+  const existingDb = await readDb();
+  const existing = existingDb.articles.find((article) => article.url === url || article.canonicalUrl === url);
+  if (existing) return { article: existing, inboxItem: null, duplicate: true };
+
+  const podcast = await resolvePodcastUrl(url);
+  if (!podcast) throw new Error("暂不支持该播客链接");
+  if (podcast.durationSeconds > transcriptionMaxDurationSeconds) {
+    throw new Error(`播客时长超过 ${Math.round(transcriptionMaxDurationSeconds / 3600)} 小时限制`);
+  }
+
+  const timestamp = now();
+  const article = {
+    id: id("article"),
+    url,
+    canonicalUrl: url,
+    title: podcast.title,
+    siteName: podcast.showName || (podcast.platform === "xiaoyuzhou" ? "小宇宙" : new URL(url).hostname),
+    author: podcast.showName || "",
+    publishedAt: "",
+    excerpt: podcast.description.slice(0, 220),
+    contentText: "",
+    contentMarkdown: "",
+    contentVersion: 0,
+    contentType: "podcast_episode",
+    podcast,
+    media: podcast.coverUrl ? [{ type: "image", url: podcast.coverUrl, alt: podcast.title }] : [],
+    contentHtmlSanitized: "",
+    source,
+    fetchStatus: "ready",
+    readingStatus: "inbox",
+    extractionMethod: `podcast_${podcast.platform}`,
+    notes: quickNote ? [{ id: id("note"), content: quickNote, createdAt: timestamp, updatedAt: timestamp }] : [],
+    highlights: [],
+    transcription: {
+      status: transcriptionEnabled ? "queued" : "not_configured",
+      provider: "tingwu",
+      providerTaskId: "",
+      transcriptVersion: 0,
+      transcriptPath: "",
+      error: transcriptionEnabled ? "" : "服务器已禁用播客转写",
+      requestedAt: timestamp,
+      updatedAt: timestamp
+    },
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+  const inboxItem = {
+    id: id("inbox"),
+    source,
+    url,
+    title: article.title,
+    quickNote,
+    status: article.transcription.status,
+    articleId: article.id,
+    errorMessage: article.transcription.error,
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+  const db = await readDb();
+  const duplicate = db.articles.find((entry) => entry.url === url || entry.canonicalUrl === url);
+  if (duplicate) return { article: duplicate, inboxItem: null, duplicate: true };
+  db.articles.unshift(article);
+  db.inboxItems.unshift(inboxItem);
+  if (transcriptionEnabled) queueTranscriptionJob(db, article);
+  await writeDb(db);
+  return { article, inboxItem, duplicate: false };
+}
+
 async function createArticleFromUrl({ url, source = "paste_url", quickNote = "" }) {
+  if (isSupportedPodcastUrl(url)) return createPodcastArticleFromUrl({ url, source, quickNote });
   const db = await readDb();
   const existing = db.articles.find((article) => article.url === url || article.canonicalUrl === url);
   if (existing) {
@@ -975,6 +1169,7 @@ async function createArticleFromUrl({ url, source = "paste_url", quickNote = "" 
       contentText: extracted.contentText,
       contentMarkdown: extracted.contentMarkdown || "",
       contentVersion: extracted.contentVersion || 2,
+      contentType: "article",
       media: extracted.media || [],
       contentHtmlSanitized: extracted.contentHtmlSanitized || "",
       source,
@@ -1017,6 +1212,7 @@ async function createArticleFromUrl({ url, source = "paste_url", quickNote = "" 
       contentText: "",
       contentMarkdown: "",
       contentVersion: 0,
+      contentType: "article",
       media: [],
       contentHtmlSanitized: "",
       source,
@@ -1247,7 +1443,10 @@ async function handleApi(req, res, path) {
 
   const isWorkerPath = path === "/api/digest-jobs/next"
     || path.match(/^\/api\/digest-jobs\/[^/]+$/)
-    || path.match(/^\/api\/digest-jobs\/[^/]+\/result$/);
+    || path.match(/^\/api\/digest-jobs\/[^/]+\/result$/)
+    || path === "/api/transcription-jobs/next"
+    || path.match(/^\/api\/transcription-jobs\/[^/]+$/)
+    || path.match(/^\/api\/transcription-jobs\/[^/]+\/result$/);
   let workerDb = null;
   let workerAuthorized = false;
   if (isWorkerPath) {
@@ -1276,7 +1475,8 @@ async function handleApi(req, res, path) {
         baseUrl: publicBaseUrl || db.settings?.baseUrl || `http://${host}:${port}`,
         mobileToken: db.settings?.mobileToken || "",
         workerToken: db.settings?.workerToken || "",
-        notion: notionSettingsForClient(db)
+        notion: notionSettingsForClient(db),
+        transcription: transcriptionSettingsForClient()
       }
     });
     return true;
@@ -1321,7 +1521,8 @@ async function handleApi(req, res, path) {
           baseUrl: publicBaseUrl || db.settings?.baseUrl || `http://${host}:${port}`,
           mobileToken: db.settings?.mobileToken || "",
           workerToken: db.settings?.workerToken || "",
-          notion: notionSettingsForClient(db)
+          notion: notionSettingsForClient(db),
+          transcription: transcriptionSettingsForClient()
         }
       });
     } catch (error) {
@@ -1344,6 +1545,143 @@ async function handleApi(req, res, path) {
   if (req.method === "GET" && path === "/api/articles") {
     const db = await readDb();
     sendJson(res, 200, { articles: db.articles.map(articleSummary) });
+    return true;
+  }
+
+  if (req.method === "GET" && path === "/api/transcription-jobs/next") {
+    const db = workerDb || await readDb();
+    const workerId = String(req.headers["x-readlater-worker-id"] || "readlater-worker").slice(0, 120);
+    const job = claimNextTranscriptionJob(db.transcriptionJobs || [], {
+      workerId,
+      leaseMs: transcriptionLeaseMs
+    });
+    if (!job) {
+      sendJson(res, 200, { job: null });
+      return true;
+    }
+    await writeDb(db);
+    sendJson(res, 200, { job });
+    return true;
+  }
+
+  if (req.method === "PATCH" && path.match(/^\/api\/transcription-jobs\/[^/]+$/)) {
+    const jobId = path.split("/").pop();
+    const body = await readJson(req);
+    const db = workerDb || await readDb();
+    const job = (db.transcriptionJobs || []).find((entry) => entry.id === jobId);
+    if (!job) {
+      sendJson(res, 404, { error: "Transcription job not found" });
+      return true;
+    }
+    if (["completed", "cancelled"].includes(job.status)) {
+      sendJson(res, 409, { error: `Transcription job is already ${job.status}` });
+      return true;
+    }
+    const allowedStatuses = new Set(["queued", "running", "waiting", "failed", "cancelled"]);
+    const allowedStages = new Set(["submit", "poll", "finalize"]);
+    if (allowedStatuses.has(body.status)) job.status = body.status;
+    if (allowedStages.has(body.stage)) job.stage = body.stage;
+    if (typeof body.providerTaskId === "string") job.providerTaskId = body.providerTaskId.slice(0, 300);
+    if (typeof body.error === "string") job.error = body.error.slice(0, 2000);
+    if (Number.isInteger(body.errorAttempts) && body.errorAttempts >= 0) job.errorAttempts = body.errorAttempts;
+    if (body.nextRunAt && Number.isFinite(new Date(body.nextRunAt).getTime())) job.nextRunAt = new Date(body.nextRunAt).toISOString();
+    if (job.status !== "running") {
+      job.workerId = "";
+      job.leaseExpiresAt = "";
+    }
+    job.updatedAt = now();
+    const article = db.articles.find((entry) => entry.id === job.articleId);
+    if (article) {
+      article.transcription ||= { provider: job.provider };
+      article.transcription.providerTaskId = job.providerTaskId || article.transcription.providerTaskId || "";
+      article.transcription.updatedAt = job.updatedAt;
+      if (job.status === "failed") {
+        article.transcription.status = "failed";
+        article.transcription.error = job.error || "转写失败";
+      } else if (job.status === "cancelled") {
+        article.transcription.status = "cancelled";
+      } else {
+        article.transcription.status = job.stage === "submit" ? "queued" : "processing";
+        if (job.stage !== "submit") article.transcription.startedAt ||= job.updatedAt;
+        article.transcription.error = "";
+      }
+      article.updatedAt = job.updatedAt;
+    }
+    await writeDb(db);
+    sendJson(res, 200, { ok: true, job });
+    return true;
+  }
+
+  if (req.method === "POST" && path.match(/^\/api\/transcription-jobs\/[^/]+\/result$/)) {
+    const jobId = path.split("/")[3];
+    const body = await readJson(req);
+    const db = workerDb || await readDb();
+    const job = (db.transcriptionJobs || []).find((entry) => entry.id === jobId);
+    if (!job) {
+      sendJson(res, 404, { error: "Transcription job not found" });
+      return true;
+    }
+    const article = db.articles.find((entry) => entry.id === job.articleId);
+    if (!article) {
+      sendJson(res, 404, { error: "Article not found" });
+      return true;
+    }
+    if (job.status === "completed") {
+      sendJson(res, 200, { ok: true, job, article: articleSummary(article) });
+      return true;
+    }
+    if (job.status === "cancelled" || article.transcription?.status === "cancelled") {
+      sendJson(res, 409, { error: "Transcription was cancelled" });
+      return true;
+    }
+    const segments = sanitizeTranscriptSegments(body.segments);
+    if (!segments.length) {
+      sendJson(res, 400, { error: "Transcript is empty" });
+      return true;
+    }
+    const version = Number(article.transcription?.transcriptVersion || 0) + 1;
+    const document = transcriptToDocument(segments);
+    const relativePath = await writeTranscript(article.id, version, {
+      articleId: article.id,
+      version,
+      provider: job.provider,
+      providerTaskId: job.providerTaskId,
+      segments
+    });
+    const timestamp = now();
+    article.contentText = document.contentText;
+    // Keep transcripts as plain text so Markdown punctuation from speech cannot
+    // change the rendered characters that highlight anchors are based on.
+    article.contentMarkdown = "";
+    article.contentVersion = Number(article.contentVersion || 0) + 1;
+    article.excerpt = document.contentText.slice(0, 220);
+    article.fetchStatus = "ready";
+    article.transcription = {
+      ...(article.transcription || {}),
+      status: "completed",
+      provider: job.provider,
+      providerTaskId: job.providerTaskId,
+      transcriptVersion: version,
+      transcriptPath: relativePath,
+      segmentCount: segments.length,
+      error: "",
+      completedAt: timestamp,
+      updatedAt: timestamp
+    };
+    article.updatedAt = timestamp;
+    job.status = "completed";
+    job.stage = "finalize";
+    job.workerId = "";
+    job.leaseExpiresAt = "";
+    job.updatedAt = timestamp;
+    const inboxItem = db.inboxItems.find((entry) => entry.articleId === article.id);
+    if (inboxItem) {
+      inboxItem.status = "completed";
+      inboxItem.errorMessage = "";
+      inboxItem.updatedAt = timestamp;
+    }
+    await writeDb(db);
+    sendJson(res, 200, { ok: true, job, article: articleSummary(article) });
     return true;
   }
 
@@ -1441,6 +1779,10 @@ async function handleApi(req, res, path) {
       sendJson(res, 404, { error: "Article not found" });
       return true;
     }
+    if (article.contentType === "podcast_episode" && article.transcription?.status !== "completed") {
+      sendJson(res, 409, { error: "播客转写完成后才能使用 Digest" });
+      return true;
+    }
     const instruction = body.instruction || body.message || digestModeLabel(mode);
     const job = {
       id: id("digest"),
@@ -1482,6 +1824,82 @@ async function handleApi(req, res, path) {
     return true;
   }
 
+  if (req.method === "GET" && path.match(/^\/api\/articles\/[^/]+\/transcript$/)) {
+    const articleId = path.split("/")[3];
+    const db = await readDb();
+    const article = db.articles.find((entry) => entry.id === articleId);
+    if (!article) {
+      sendJson(res, 404, { error: "Article not found" });
+      return true;
+    }
+    const transcript = await readTranscript(article);
+    sendJson(res, 200, {
+      articleId,
+      status: article.transcription?.status || "not_available",
+      version: article.transcription?.transcriptVersion || 0,
+      segments: transcript?.segments || []
+    });
+    return true;
+  }
+
+  if (req.method === "POST" && path.match(/^\/api\/articles\/[^/]+\/transcription\/retry$/)) {
+    const articleId = path.split("/")[3];
+    if (!transcriptionEnabled) {
+      sendJson(res, 503, { error: "服务器已禁用播客转写" });
+      return true;
+    }
+    const db = await readDb();
+    const article = db.articles.find((entry) => entry.id === articleId);
+    if (!article) {
+      sendJson(res, 404, { error: "Article not found" });
+      return true;
+    }
+    if (article.contentType !== "podcast_episode") {
+      sendJson(res, 400, { error: "这不是播客内容" });
+      return true;
+    }
+    if (article.transcription?.status === "completed" && article.highlights?.length) {
+      sendJson(res, 409, { error: "文稿已有标注，为避免标注错位，不能直接重新转写" });
+      return true;
+    }
+    const active = (db.transcriptionJobs || []).find((job) => (
+      job.articleId === articleId && ["queued", "waiting", "running"].includes(job.status)
+    ));
+    const job = active || queueTranscriptionJob(db, article, { force: true });
+    await writeDb(db);
+    sendJson(res, 200, { ok: true, job, article: articleSummary(article) });
+    return true;
+  }
+
+  if (req.method === "POST" && path.match(/^\/api\/articles\/[^/]+\/transcription\/cancel$/)) {
+    const articleId = path.split("/")[3];
+    const db = await readDb();
+    const article = db.articles.find((entry) => entry.id === articleId);
+    if (!article) {
+      sendJson(res, 404, { error: "Article not found" });
+      return true;
+    }
+    const timestamp = now();
+    for (const job of db.transcriptionJobs || []) {
+      if (job.articleId === articleId && ["queued", "waiting", "running"].includes(job.status)) {
+        job.status = "cancelled";
+        job.workerId = "";
+        job.leaseExpiresAt = "";
+        job.updatedAt = timestamp;
+      }
+    }
+    article.transcription = {
+      ...(article.transcription || {}),
+      status: "cancelled",
+      error: "",
+      updatedAt: timestamp
+    };
+    article.updatedAt = timestamp;
+    await writeDb(db);
+    sendJson(res, 200, { ok: true, article: articleSummary(article) });
+    return true;
+  }
+
   if (req.method === "GET" && path.match(/^\/api\/articles\/[^/]+$/)) {
     const articleId = path.split("/").pop();
     const db = await readDb();
@@ -1497,12 +1915,16 @@ async function handleApi(req, res, path) {
       sendJson(res, 400, { error: "url is required" });
       return true;
     }
-    const result = await createArticleFromUrl({
-      url: body.url,
-      source: body.source || "paste_url",
-      quickNote: body.note || ""
-    });
-    sendJson(res, 200, { ok: true, article: articleSummary(result.article), duplicate: result.duplicate });
+    try {
+      const result = await createArticleFromUrl({
+        url: body.url,
+        source: body.source || "paste_url",
+        quickNote: body.note || ""
+      });
+      sendJson(res, 200, { ok: true, article: articleSummary(result.article), duplicate: result.duplicate });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
     return true;
   }
 
@@ -1517,18 +1939,22 @@ async function handleApi(req, res, path) {
       sendJson(res, 400, { error: "url is required" });
       return true;
     }
-    const result = await createArticleFromUrl({
-      url: body.url,
-      source: "ios_shortcut",
-      quickNote: body.note || ""
-    });
-    sendJson(res, 200, {
-      ok: true,
-      itemId: result.inboxItem?.id || null,
-      article: articleSummary(result.article),
-      status: result.article.fetchStatus,
-      duplicate: result.duplicate
-    });
+    try {
+      const result = await createArticleFromUrl({
+        url: body.url,
+        source: "ios_shortcut",
+        quickNote: body.note || ""
+      });
+      sendJson(res, 200, {
+        ok: true,
+        itemId: result.inboxItem?.id || null,
+        article: articleSummary(result.article),
+        status: result.article.fetchStatus,
+        duplicate: result.duplicate
+      });
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
     return true;
   }
 
@@ -1727,7 +2153,9 @@ async function handleApi(req, res, path) {
     db.articles = db.articles.filter((article) => article.id !== articleId);
     db.inboxItems = db.inboxItems.filter((item) => item.articleId !== articleId);
     db.digestJobs = (db.digestJobs || []).filter((job) => job.articleId !== articleId);
+    db.transcriptionJobs = (db.transcriptionJobs || []).filter((job) => job.articleId !== articleId);
     await writeDb(db);
+    await rm(join(transcriptDir, articleId), { recursive: true, force: true });
     sendJson(res, 200, { ok: true, id: articleId });
     return true;
   }
@@ -1944,7 +2372,12 @@ createServer(async (req, res) => {
       return;
     }
     if (url.pathname.startsWith("/api/")) {
-      const handled = await handleApi(req, res, url.pathname);
+      const mutatesState = !["GET", "HEAD"].includes(req.method)
+        || url.pathname === "/api/digest-jobs/next"
+        || url.pathname === "/api/transcription-jobs/next";
+      const handled = mutatesState
+        ? await withMutationLock(() => handleApi(req, res, url.pathname))
+        : await handleApi(req, res, url.pathname);
       if (!handled) sendJson(res, 404, { error: "Not found" });
       return;
     }

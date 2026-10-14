@@ -53,13 +53,13 @@ For a long-running instance, supervise the process with systemd, PM2, or another
 
 ## Backups
 
-The included script writes timestamped database and media archives:
+The included script writes timestamped database, media, and transcript archives:
 
 ```bash
 ./scripts/backup-readlater-data.sh
 ```
 
-Back up both `data/readlater.json` and `data/media/`. Test restoration before relying on an automated schedule.
+Back up `data/readlater.json`, `data/media/`, and `data/transcripts/`. Test restoration before relying on an automated schedule.
 
 ## Security checklist
 

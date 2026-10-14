@@ -26,13 +26,14 @@
 
 AI 面板与当前文章共享上下文，可以基于标注生成 L1 Digest、让 AI 先读先标注，或继续围绕本文讨论。
 
-Readlater 不是另一个“只进不出”的收藏夹。它希望接住保存之后的第二段旅程：从浏览器收下一篇文章，阅读干净的本地副本，标出真正重要的句子，记录当时的想法，并按需生成摘要或同步到 Notion。
+Readlater 不是另一个“只进不出”的收藏夹。它希望接住保存之后的第二段旅程：从浏览器收下一篇文章或导入一期播客，阅读干净的本地正文，标出真正重要的句子，记录当时的想法，并按需生成摘要或同步到 Notion。
 
 ## 它解决什么问题
 
 收藏很容易，重新打开、读完并形成自己的理解却很难。Readlater 把这条链路放在一个小而完整的自托管应用中：
 
 - **保存真正有用的版本**：通过 Chrome 扩展保存普通网页、X 帖子和微信公众号文章，保留语义化 Markdown 与文章图片。
+- **把播客变成可读正文**：导入小宇宙单集或公开音频链接，通过通义听悟转写、自动识别说话人，并按时间与语义自然分段。
 - **不丢失原文结构**：在专注阅读界面中保留标题、列表、表格、代码块和链接。
 - **围绕原文思考**：精确划线并添加评论，支持跨链接、加粗等行内格式的文本选择。
 - **继续消化内容**：按需翻译片段、生成文章 Digest、追问文章内容，或把笔记追加到 Notion。
@@ -43,6 +44,7 @@ Readlater 不是另一个“只进不出”的收藏夹。它希望接住保存�
 ```mermaid
 flowchart LR
     A[网页内容] -->|Chrome 扩展| B[阅读收件箱]
+    P[播客链接] -->|转写与说话人识别| B
     B --> C[干净的本地正文]
     C --> D[精确划线与评论]
     D --> E[AI Digest 与追问]
@@ -51,7 +53,7 @@ flowchart LR
 
 一次典型的使用过程：
 
-1. 在浏览器中打开文章，通过扩展保存到 Readlater。
+1. 在浏览器中打开文章，通过扩展保存；也可以直接粘贴播客链接。
 2. 从收件箱进入经过规范化处理的本地正文。
 3. 选中准确的原文范围，添加划线或评论。
 4. 阅读完成后归档文章，或继续生成 Digest、追问和同步笔记。
@@ -60,7 +62,8 @@ flowchart LR
 
 | 模块 | 能力 |
 | --- | --- |
-| 内容保存 | Chrome 扩展、普通网页、X 帖子、微信公众号文章、语义化 Markdown、图片本地化 |
+| 内容保存 | Chrome 扩展、普通网页、X 帖子、微信公众号文章、播客链接、语义化 Markdown、图片本地化 |
+| 播客转写 | 小宇宙与公开音频、异步任务、说话人识别、自然分段、时间戳文稿 |
 | 专注阅读 | 收件箱与归档、响应式界面、保留链接、列表、表格和代码块 |
 | 标注思考 | 精确划线、跨格式选择、评论、可恢复的文本锚点 |
 | 内容消化 | 可选翻译、AI Digest、连续追问、Notion 追加 |
@@ -76,8 +79,10 @@ flowchart TB
     UI[Web 界面] -->|阅读与标注| SERVER
     SERVER --> JSON[(data/readlater.json)]
     SERVER --> MEDIA[(data/media)]
+    SERVER --> TRANSCRIPTS[(data/transcripts)]
     SERVER -. 任务队列 .-> WORKER[可选 AI Worker]
     WORKER -. OpenAI 兼容接口 .-> MODEL[模型服务]
+    WORKER -. 可选转写 .-> TINGWU[通义听悟]
     SERVER -. 可选同步 .-> NOTION[Notion]
 ```
 
@@ -153,6 +158,25 @@ pnpm worker
 </details>
 
 <details>
+<summary><strong>播客转写</strong></summary>
+
+Web 服务只负责解析链接和创建任务，转写由同一个 `pnpm worker` 进程异步处理。配置通义听悟凭证后，可导入小宇宙单集链接或公开的 MP3、M4A、WAV、AAC、OGG、FLAC 链接：
+
+```dotenv
+TRANSCRIPTION_PROVIDER=tingwu
+TINGWU_ACCESS_KEY_ID=...
+TINGWU_ACCESS_KEY_SECRET=...
+TINGWU_APP_KEY=...
+TINGWU_SOURCE_LANGUAGE=cn
+TINGWU_DIARIZATION_ENABLED=true
+TINGWU_SPEAKER_COUNT=0
+```
+
+`TINGWU_SPEAKER_COUNT=0` 表示自动判断；双人播客也可设为 `2`。Worker Token 与启动方式和 AI Digest Worker 相同。为降低真实服务测试成本，可先用短音频执行 `pnpm smoke:tingwu -- <public-audio-url>`。
+
+</details>
+
+<details>
 <summary><strong>Notion</strong></summary>
 
 可以在 Setup 页面配置 Notion，也可以使用 `NOTION_TOKEN` 和 `NOTION_PARENT_PAGE_ID` 环境变量。建议创建专用 Integration，并且只授予目标页面所需的最小权限。
@@ -165,6 +189,7 @@ pnpm worker
 
 - `data/readlater.json`：文章、设置、划线、评论和任务状态
 - `data/media/`：下载到本地的文章图片
+- `data/transcripts/`：按文章和版本保存的时间戳转写片段
 
 `.env`、Worker 日志、浏览器自动化状态和全部运行时数据都不会进入仓库。即便如此，在公开自己的 Fork 前，仍建议检查完整 Git 历史中是否曾误提交凭据。
 

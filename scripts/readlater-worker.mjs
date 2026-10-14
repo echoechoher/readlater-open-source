@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -8,10 +9,24 @@ import {
 import {
   buildDigestPrompt,
   buildDigestSystemPrompt,
+  buildDigestMapPrompt,
   buildNotionRoutingSystemPrompt,
   buildNotionRoutingPrompt,
+  contentAroundHighlights,
   parseDigestResponse
 } from "../lib/digest-workflow.mjs";
+import { createTingwuProvider, isTingwuConfigured, tingwuConfig } from "../lib/tingwu.mjs";
+import { createTranscriptChunks } from "../lib/transcription.mjs";
+import { advanceTranscriptionJob } from "../lib/transcription-worker.mjs";
+
+if (process.env.TINGWU_CREDENTIALS_FILE) {
+  try {
+    process.loadEnvFile(resolve(process.env.TINGWU_CREDENTIALS_FILE));
+  } catch (error) {
+    console.error(`Unable to load TINGWU_CREDENTIALS_FILE: ${error.message}`);
+    process.exit(1);
+  }
+}
 
 const rootDir = fileURLToPath(new URL("../", import.meta.url));
 const baseUrl = (process.env.READLATER_BASE_URL || "http://127.0.0.1:3000").replace(/\/$/, "");
@@ -24,6 +39,7 @@ const pollMs = Number(process.env.READLATER_WORKER_POLL_MS || 5000);
 const providerRetryCount = Number(process.env.AI_RETRY_COUNT || 3);
 const providerRetryDelayMs = Number(process.env.AI_RETRY_DELAY_MS || 3000);
 const once = process.argv.includes("--once");
+const workerId = process.env.READLATER_WORKER_ID || `worker-${randomUUID().slice(0, 8)}`;
 
 if (!workerToken) {
   console.error("READLATER_WORKER_TOKEN is required.");
@@ -49,6 +65,7 @@ async function request(path, options = {}) {
     ...options,
     headers: {
       "Authorization": `Bearer ${workerToken}`,
+      "X-Readlater-Worker-Id": workerId,
       "Content-Type": "application/json",
       ...(options.headers || {})
     }
@@ -57,6 +74,56 @@ async function request(path, options = {}) {
   const data = text ? JSON.parse(text) : {};
   if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
   return data;
+}
+
+function nextRunAt(delayMs) {
+  return new Date(Date.now() + delayMs).toISOString();
+}
+
+async function updateTranscriptionJob(job, body) {
+  return request(`/api/transcription-jobs/${job.id}`, {
+    method: "PATCH",
+    body: JSON.stringify(body)
+  });
+}
+
+async function processNextTranscriptionJob(provider) {
+  if (!provider) return false;
+  const { job } = await request("/api/transcription-jobs/next");
+  if (!job) return false;
+  console.log(`[readlater-worker] transcription ${job.id} (${job.stage})`);
+
+  try {
+    const outcome = await advanceTranscriptionJob(job, provider);
+    if (outcome.type === "complete") {
+      await request(`/api/transcription-jobs/${job.id}/result`, {
+        method: "POST",
+        body: JSON.stringify(outcome.body)
+      });
+      console.log(`[readlater-worker] transcription done ${job.id} (${outcome.body.segments.length} segments)`);
+      return true;
+    }
+    await updateTranscriptionJob(job, outcome.body);
+    if (job.stage === "submit") console.log(`[readlater-worker] transcription submitted ${job.id}`);
+    return true;
+  } catch (error) {
+    const errorAttempts = Number(job.errorAttempts || 0) + 1;
+    const canRetryPoll = job.stage === "poll" && error.retryable !== false && errorAttempts < 8;
+    await updateTranscriptionJob(job, canRetryPoll ? {
+      status: "waiting",
+      stage: "poll",
+      nextRunAt: nextRunAt(Math.min(provider.pollMs * (2 ** Math.max(0, errorAttempts - 1)), 5 * 60 * 1000)),
+      errorAttempts,
+      error: error.message
+    } : {
+      status: "failed",
+      stage: job.stage,
+      errorAttempts,
+      error: error.message
+    });
+    console.error(`[readlater-worker] transcription failed ${job.id}: ${error.message}`);
+    return true;
+  }
 }
 
 function safeFilename(value = "") {
@@ -148,9 +215,42 @@ async function processNextJob(digestInstructions) {
   console.log(`[readlater-worker] running ${job.id} (${job.mode}, ${provider})`);
   let prompt = "";
   try {
+    let effectiveJob = job;
+    if (job.mode !== "notion_route" && job.inputSnapshot?.contentType === "podcast_episode") {
+      const snapshot = job.inputSnapshot;
+      const source = snapshot.contentMarkdown || snapshot.contentText || "";
+      const highlightContext = job.mode === "sop_a_echo_marks" ? contentAroundHighlights(snapshot) : "";
+      if (highlightContext) {
+        effectiveJob = {
+          ...job,
+          inputSnapshot: { ...snapshot, contentMarkdown: highlightContext, contentText: "" }
+        };
+      } else {
+        const chunks = createTranscriptChunks(source);
+        if (chunks.length > 1) {
+          const summaries = [];
+          for (let index = 0; index < chunks.length; index += 1) {
+            const mapPrompt = buildDigestMapPrompt(chunks[index], index, chunks.length);
+            summaries.push(await createProviderCompletionWithRetry(
+              mapPrompt,
+              job,
+              "你负责忠实压缩播客文稿分块，为后续整体消化保留必要信息。不要编造，不要输出控制协议。"
+            ));
+          }
+          effectiveJob = {
+            ...job,
+            inputSnapshot: {
+              ...snapshot,
+              contentMarkdown: summaries.map((summary, index) => `## 文稿分块 ${index + 1}\n\n${summary}`).join("\n\n"),
+              contentText: ""
+            }
+          };
+        }
+      }
+    }
     prompt = job.mode === "notion_route"
-      ? buildNotionRoutingPrompt(job)
-      : buildDigestPrompt(job);
+      ? buildNotionRoutingPrompt(effectiveJob)
+      : buildDigestPrompt(effectiveJob);
     const systemPrompt = job.mode === "notion_route"
       ? buildNotionRoutingSystemPrompt()
       : buildDigestSystemPrompt(digestInstructions);
@@ -196,9 +296,20 @@ async function main() {
   console.log(`[readlater-worker] provider ${config.label}`);
   console.log(`[readlater-worker] endpoint ${config.url}`);
   console.log(`[readlater-worker] log dir ${logDir}`);
+  const transcriptionProvider = String(process.env.TRANSCRIPTION_PROVIDER || "tingwu").toLowerCase() === "tingwu"
+    && isTingwuConfigured()
+    ? createTingwuProvider()
+    : null;
+  console.log(`[readlater-worker] transcription ${transcriptionProvider ? "Tingwu enabled" : "disabled (credentials not configured)"}`);
+  if (transcriptionProvider) {
+    const transcriptionConfig = tingwuConfig();
+    console.log(`[readlater-worker] transcription language ${transcriptionConfig.sourceLanguage} · diarization ${transcriptionConfig.diarizationEnabled ? `enabled (${transcriptionConfig.speakerCount || "auto"})` : "disabled"}`);
+  }
   do {
     try {
-      const processed = await processNextJob(digestInstructions);
+      const transcriptionProcessed = await processNextTranscriptionJob(transcriptionProvider);
+      const digestProcessed = transcriptionProcessed ? false : await processNextJob(digestInstructions);
+      const processed = transcriptionProcessed || digestProcessed;
       if (once) break;
       if (!processed) await new Promise((resolve) => setTimeout(resolve, pollMs));
     } catch (error) {

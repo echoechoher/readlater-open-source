@@ -12,6 +12,8 @@ node --check extension/content-script.js
 node --check extension/content-normalization.js
 ```
 
+Automated coverage includes podcast URL security, Xiaoyuzhou parsing, Tingwu result normalization, task leases and recovery, transcript persistence, API state transitions, duplicate imports, cancellation, retry protection, and long-transcript Digest chunking.
+
 ## Content Fidelity
 
 - WeChat prose should not contain repeated visible spaces outside `pre` and `code`.
@@ -34,6 +36,27 @@ node --check extension/content-normalization.js
 - AI: run L1, run L2, and send one free-form follow-up. Messages should stay in one article-scoped conversation and render Markdown.
 - Archive: archive an item, switch to Archive, restore it, and confirm it returns to Inbox.
 - Delete: right-click an Inbox item, confirm the small menu appears, then delete only a disposable test item.
+
+## Podcast Transcription
+
+- Import one Xiaoyuzhou episode. The API should return after metadata parsing without waiting for transcription, and the list should show “等待转写”.
+- Import one public MP3 or M4A URL. It should be classified as a podcast episode without downloading the media into the web process.
+- Import the same episode twice. It must return the existing article and must not create or submit a second paid transcription job.
+- Confirm the Worker transitions the episode through queued → processing → completed and survives a Worker restart while the provider task is running.
+- Stop the Worker after it claims a polling task. After the lease expires, another Worker must reclaim it. A submission interrupted before the provider task ID is saved must fail safely instead of silently submitting twice.
+- During queued/processing, the reader should show a low-noise status card, the cancel action should work, and Digest controls should be disabled.
+- Simulate provider failure and a transient status-query failure. Terminal failures should expose a retry button; transient polling failures should back off without creating another provider task.
+- Verify transcription requests enable speaker diarization by default and allow an explicit environment override.
+- Verify transcript layout starts a new block on speaker changes, long pauses, sufficiently large provider paragraph boundaries, and maximum paragraph length without splitting inside a sentence.
+- Verify completed, unannotated podcast transcripts can be re-run from the reader so an older transcript can gain speaker labels; annotated transcripts must remain protected from reflow.
+- Complete a fake-provider job and confirm the timestamped transcript is stored under `data/transcripts/<articleId>/<version>.json`, while article-list responses do not include the segment array.
+- Highlight Chinese text in the completed transcript, reload, and reopen the episode. The exact range must remain highlighted and the reader must not jump to the top.
+- After a completed transcript has highlights, retrying transcription must be rejected to protect saved anchors.
+- Run L1 with transcript highlights and verify only nearby transcript context is sent. Run L2 on a long transcript and verify map-reduce chunking stays within the configured character budget.
+- Delete a disposable podcast article and confirm its jobs and transcript directory are removed.
+- Test the status card and long transcript at desktop width and at or below 760 px.
+- Before a real-provider smoke test, verify Tingwu credentials never appear in browser responses, `data/readlater.json`, Worker logs, or Git status.
+- Run `pnpm smoke:tingwu -- <public-audio-url>` to verify the configured account can submit, poll, download, and normalize one real Tingwu result. Use a short disposable audio file to minimize cost.
 
 ## Highlight Anchoring And Scroll Stability
 
