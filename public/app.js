@@ -802,12 +802,7 @@ function renderImportDialog() {
         </div>
         <form class="import-dialog-form" id="import-url-form">
           <label for="import-url-input">链接</label>
-          <input id="import-url-input" type="url" inputmode="url" autocomplete="off" aria-describedby="import-url-help" placeholder="https://example.com/article-or-podcast" value="${escapeHtml(state.importUrlDraft)}" required ${state.loading ? "disabled" : ""} />
-          <div class="import-url-help" id="import-url-help">
-            <span>文章</span>
-            <span>播客</span>
-            <span>音频直链</span>
-          </div>
+          <input id="import-url-input" type="url" inputmode="url" autocomplete="off" placeholder="https://example.com/article-or-podcast" value="${escapeHtml(state.importUrlDraft)}" required ${state.loading ? "disabled" : ""} />
           ${state.importStatus ? `<div class="import-dialog-status" role="status" aria-live="polite">${escapeHtml(state.importStatus)}</div>` : ""}
           <div class="import-dialog-actions">
             <button type="button" data-close-import-dialog ${state.loading ? "disabled" : ""}>取消</button>

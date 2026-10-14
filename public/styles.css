@@ -334,21 +334,6 @@ textarea:focus-visible,
   color: #a4a9b2;
 }
 
-.import-url-help {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
-}
-
-.import-url-help span {
-  background: var(--soft);
-  border-radius: 999px;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1;
-  padding: 5px 8px;
-}
-
 .import-dialog-status {
   color: var(--muted);
   font-size: 12px;
