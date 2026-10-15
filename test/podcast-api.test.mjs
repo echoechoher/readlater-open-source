@@ -102,6 +102,8 @@ test("podcast API covers import, job lifecycle, transcript storage, duplicate pr
   const claimed = await json(baseUrl, "/api/transcription-jobs/next", { headers: workerHeaders });
   assert.equal(claimed.response.status, 200);
   assert.equal(claimed.body.job.stage, "submit");
+  assert.ok(Array.isArray(claimed.body.job.hotwords));
+  assert.equal(claimed.body.job.speakerCount, 0);
   const jobId = claimed.body.job.id;
 
   await json(baseUrl, `/api/transcription-jobs/${jobId}`, {
@@ -111,6 +113,7 @@ test("podcast API covers import, job lifecycle, transcript storage, duplicate pr
       status: "waiting",
       stage: "poll",
       providerTaskId: "provider-task-1",
+      hotwordPhraseId: "phrase-1",
       nextRunAt: "2000-01-01T00:00:00.000Z"
     })
   });
@@ -121,10 +124,14 @@ test("podcast API covers import, job lifecycle, transcript storage, duplicate pr
   const completed = await json(baseUrl, `/api/transcription-jobs/${jobId}/result`, {
     method: "POST",
     headers: workerHeaders,
-    body: JSON.stringify({ segments: [
-      { startMs: 0, endMs: 800, text: "第一句。" },
-      { startMs: 800, endMs: 1600, text: "第二句。" }
-    ] })
+    body: JSON.stringify({
+      providerMetadata: { detectedLanguage: "cn", audioInfo: { Duration: 1600 } },
+      correctionMetadata: { provider: "venus", chunks: 1, correctedSegments: 1, failedChunks: 0 },
+      segments: [
+        { startMs: 0, endMs: 800, text: "第一句。" },
+        { startMs: 800, endMs: 1600, text: "第二句。" }
+      ]
+    })
   });
   assert.equal(completed.response.status, 200);
   assert.equal(completed.body.article.transcription.status, "completed");
@@ -143,6 +150,8 @@ test("podcast API covers import, job lifecycle, transcript storage, duplicate pr
   assert.deepEqual(transcript.body.segments.map((segment) => segment.text), ["第一句。", "第二句。"]);
   const transcriptFile = JSON.parse(await readFile(join(dataDir, "transcripts", articleId, "1.json"), "utf8"));
   assert.equal(transcriptFile.segments.length, 2);
+  assert.equal(transcriptFile.providerMetadata.detectedLanguage, "cn");
+  assert.equal(transcriptFile.correctionMetadata.correctedSegments, 1);
 
   await json(baseUrl, `/api/articles/${articleId}/highlights`, {
     method: "POST",
@@ -159,6 +168,17 @@ test("podcast API covers import, job lifecycle, transcript storage, duplicate pr
     body: JSON.stringify({ url: "https://8.8.4.4/cancel-me.mp3" })
   });
   const secondClaim = await json(baseUrl, "/api/transcription-jobs/next", { headers: workerHeaders });
+  await json(baseUrl, `/api/transcription-jobs/${secondClaim.body.job.id}`, {
+    method: "PATCH",
+    headers: workerHeaders,
+    body: JSON.stringify({
+      status: "waiting",
+      stage: "poll",
+      providerTaskId: "cancel-provider-task",
+      hotwordPhraseId: "cancel-phrase",
+      nextRunAt: "2100-01-01T00:00:00.000Z"
+    })
+  });
   const cancelled = await json(baseUrl, `/api/articles/${second.body.article.id}/transcription/cancel`, {
     method: "POST",
     body: JSON.stringify({})
@@ -170,6 +190,15 @@ test("podcast API covers import, job lifecycle, transcript storage, duplicate pr
     body: JSON.stringify({ status: "waiting", stage: "poll", providerTaskId: "too-late" })
   });
   assert.equal(lateProgress.response.status, 409);
+  const cleanupClaim = await json(baseUrl, "/api/transcription-jobs/next", { headers: workerHeaders });
+  assert.equal(cleanupClaim.body.job.id, secondClaim.body.job.id);
+  assert.equal(cleanupClaim.body.job.stage, "cleanup");
+  const cleanupDone = await json(baseUrl, `/api/transcription-jobs/${secondClaim.body.job.id}`, {
+    method: "PATCH",
+    headers: workerHeaders,
+    body: JSON.stringify({ status: "cancelled", stage: "cleanup", hotwordPhraseId: "" })
+  });
+  assert.equal(cleanupDone.response.status, 200);
 
   const unsafe = await json(baseUrl, "/api/inbox/url", {
     method: "POST",

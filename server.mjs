@@ -33,6 +33,8 @@ import {
 } from "./lib/podcast.mjs";
 import {
   claimNextTranscriptionJob,
+  extractTranscriptionHotwords,
+  inferTranscriptionSpeakerCount,
   sanitizeTranscriptSegments,
   transcriptToDocument
 } from "./lib/transcription.mjs";
@@ -880,6 +882,11 @@ function queueTranscriptionJob(db, article, { force = false } = {}) {
   ));
   if (active && !force) return active;
   const timestamp = now();
+  const transcriptionContext = {
+    title: article.title || article.podcast?.title || "",
+    showName: article.podcast?.showName || "",
+    description: article.podcast?.description || ""
+  };
   const job = {
     id: id("transcription"),
     articleId: article.id,
@@ -887,7 +894,10 @@ function queueTranscriptionJob(db, article, { force = false } = {}) {
     stage: "submit",
     status: "queued",
     audioUrl: article.podcast?.audioUrl || "",
+    hotwords: extractTranscriptionHotwords(transcriptionContext),
+    speakerCount: inferTranscriptionSpeakerCount(transcriptionContext),
     providerTaskId: "",
+    hotwordPhraseId: "",
     attempts: 0,
     errorAttempts: 0,
     nextRunAt: timestamp,
@@ -1580,10 +1590,15 @@ async function handleApi(req, res, path) {
       return true;
     }
     const allowedStatuses = new Set(["queued", "running", "waiting", "failed", "cancelled"]);
-    const allowedStages = new Set(["submit", "poll", "finalize"]);
+    const allowedStages = new Set(["submit", "poll", "cleanup", "finalize"]);
+    if (job.cleanupRequested && !(body.status === "cancelled" && body.stage === "cleanup")) {
+      sendJson(res, 409, { error: "Transcription cancellation cleanup is pending" });
+      return true;
+    }
     if (allowedStatuses.has(body.status)) job.status = body.status;
     if (allowedStages.has(body.stage)) job.stage = body.stage;
     if (typeof body.providerTaskId === "string") job.providerTaskId = body.providerTaskId.slice(0, 300);
+    if (typeof body.hotwordPhraseId === "string") job.hotwordPhraseId = body.hotwordPhraseId.slice(0, 300);
     if (typeof body.error === "string") job.error = body.error.slice(0, 2000);
     if (Number.isInteger(body.errorAttempts) && body.errorAttempts >= 0) job.errorAttempts = body.errorAttempts;
     if (body.nextRunAt && Number.isFinite(new Date(body.nextRunAt).getTime())) job.nextRunAt = new Date(body.nextRunAt).toISOString();
@@ -1593,7 +1608,7 @@ async function handleApi(req, res, path) {
     }
     job.updatedAt = now();
     const article = db.articles.find((entry) => entry.id === job.articleId);
-    if (article) {
+    if (article && !job.cleanupRequested) {
       article.transcription ||= { provider: job.provider };
       article.transcription.providerTaskId = job.providerTaskId || article.transcription.providerTaskId || "";
       article.transcription.updatedAt = job.updatedAt;
@@ -1648,6 +1663,13 @@ async function handleApi(req, res, path) {
       version,
       provider: job.provider,
       providerTaskId: job.providerTaskId,
+      hotwords: Array.isArray(job.hotwords) ? job.hotwords : [],
+      providerMetadata: body.providerMetadata && typeof body.providerMetadata === "object"
+        ? body.providerMetadata
+        : null,
+      correctionMetadata: body.correctionMetadata && typeof body.correctionMetadata === "object"
+        ? body.correctionMetadata
+        : null,
       segments
     });
     const timestamp = now();
@@ -1865,7 +1887,9 @@ async function handleApi(req, res, path) {
       return true;
     }
     const active = (db.transcriptionJobs || []).find((job) => (
-      job.articleId === articleId && ["queued", "waiting", "running"].includes(job.status)
+      job.articleId === articleId
+      && !job.cleanupRequested
+      && ["queued", "waiting", "running"].includes(job.status)
     ));
     const job = active || queueTranscriptionJob(db, article, { force: true });
     await writeDb(db);
@@ -1884,7 +1908,14 @@ async function handleApi(req, res, path) {
     const timestamp = now();
     for (const job of db.transcriptionJobs || []) {
       if (job.articleId === articleId && ["queued", "waiting", "running"].includes(job.status)) {
-        job.status = "cancelled";
+        if (job.hotwordPhraseId) {
+          job.status = "waiting";
+          job.stage = "cleanup";
+          job.cleanupRequested = true;
+          job.nextRunAt = timestamp;
+        } else {
+          job.status = "cancelled";
+        }
         job.workerId = "";
         job.leaseExpiresAt = "";
         job.updatedAt = timestamp;

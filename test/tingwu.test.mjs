@@ -28,14 +28,69 @@ test("Tingwu provider submits offline transcription with a stable task key", asy
     }
   });
   assert.deepEqual(await provider.submit({ audioUrl: "https://cdn.example.com/audio.mp3", taskKey: "job-1" }), {
-    providerTaskId: "task-123"
+    providerTaskId: "task-123",
+    hotwordPhraseId: ""
   });
   assert.equal(request.type, "offline");
   assert.equal(request.input.fileUrl, "https://cdn.example.com/audio.mp3");
   assert.equal(request.input.taskKey, "job_1");
   assert.equal(request.parameters.transcription.diarizationEnabled, true);
   assert.equal(request.parameters.transcription.diarization.speakerCount, 0);
+  assert.equal(request.parameters.transcription.audioEventDetectionEnabled, true);
   assert.equal(request.parameters.transcription.outputLevel, 1);
+});
+
+test("Tingwu provider creates a temporary hotword list and applies interview speaker count", async () => {
+  let phraseRequest;
+  let taskRequest;
+  const deleted = [];
+  const provider = createTingwuProvider({
+    env: configuredEnv,
+    client: {
+      async createTranscriptionPhrases(value) {
+        phraseRequest = value;
+        return { body: { code: "0", data: { phraseId: "phrase-123" } } };
+      },
+      async createTask(value) {
+        taskRequest = value;
+        return { body: { code: "0", data: { taskId: "task-with-hotwords" } } };
+      },
+      async deleteTranscriptionPhrases(value) { deleted.push(value); }
+    }
+  });
+  assert.deepEqual(await provider.submit({
+    audioUrl: "https://cdn.example.com/interview.m4a",
+    taskKey: "job-interview",
+    hotwords: ["Ambi", "Openclaw", "莫子皓"],
+    speakerCount: 2
+  }), {
+    providerTaskId: "task-with-hotwords",
+    hotwordPhraseId: "phrase-123"
+  });
+  assert.deepEqual(JSON.parse(phraseRequest.wordWeights), { Ambi: 3, Openclaw: 3, 莫子皓: 3 });
+  assert.equal(taskRequest.parameters.transcription.phraseId, "phrase-123");
+  assert.equal(taskRequest.parameters.transcription.diarization.speakerCount, 2);
+  assert.equal(await provider.cleanupHotwords("phrase-123"), true);
+  assert.deepEqual(deleted, ["phrase-123"]);
+});
+
+test("Tingwu provider releases a temporary hotword list when task creation fails", async () => {
+  const deleted = [];
+  const provider = createTingwuProvider({
+    env: configuredEnv,
+    client: {
+      async createTranscriptionPhrases() {
+        return { body: { code: "0", data: { phraseId: "phrase-failed" } } };
+      },
+      async createTask() { return { body: { code: "500", message: "quota" } }; },
+      async deleteTranscriptionPhrases(value) { deleted.push(value); }
+    }
+  });
+  await assert.rejects(
+    provider.submit({ audioUrl: "https://cdn.example.com/audio.mp3", taskKey: "job-failed", hotwords: ["Ambi"] }),
+    /quota/
+  );
+  assert.deepEqual(deleted, ["phrase-failed"]);
 });
 
 test("Tingwu speaker diarization can be disabled explicitly", async () => {
@@ -97,9 +152,10 @@ test("Tingwu result downloader normalizes provider JSON", async () => {
       Transcription: { Paragraphs: [{ Words: [{ SentenceId: 1, Start: 0, End: 120, Text: "你好" }] }] }
     }), { status: 200, headers: { "content-type": "application/json" } })
   });
-  assert.deepEqual(await provider.fetchResult("https://result.example/test.json"), [
-    { startMs: 0, endMs: 120, text: "你好", speaker: "", paragraphIndex: 0 }
-  ]);
+  assert.deepEqual(await provider.fetchResult("https://result.example/test.json"), {
+    segments: [{ startMs: 0, endMs: 120, text: "你好", speaker: "", paragraphIndex: 0 }],
+    providerMetadata: { detectedLanguage: "", audioInfo: null, audioSegments: [] }
+  });
 });
 
 test("Tingwu result downloader rejects a provider language mismatch", async () => {

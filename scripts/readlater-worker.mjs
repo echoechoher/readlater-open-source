@@ -17,6 +17,7 @@ import {
 } from "../lib/digest-workflow.mjs";
 import { createTingwuProvider, isTingwuConfigured, tingwuConfig } from "../lib/tingwu.mjs";
 import { createTranscriptChunks } from "../lib/transcription.mjs";
+import { correctTranscriptSegments } from "../lib/transcript-correction.mjs";
 import { advanceTranscriptionJob } from "../lib/transcription-worker.mjs";
 
 if (process.env.TINGWU_CREDENTIALS_FILE) {
@@ -38,6 +39,8 @@ const logDir = process.env.READLATER_WORKER_LOG_DIR || join(rootDir, "output/dig
 const pollMs = Number(process.env.READLATER_WORKER_POLL_MS || 5000);
 const providerRetryCount = Number(process.env.AI_RETRY_COUNT || 3);
 const providerRetryDelayMs = Number(process.env.AI_RETRY_DELAY_MS || 3000);
+const transcriptionCorrectionEnabled = String(process.env.TRANSCRIPTION_CORRECTION_ENABLED || "true").toLowerCase() !== "false";
+const providerCorrectionEnabled = transcriptionCorrectionEnabled && Boolean(openAICompatibleConfig().token);
 const once = process.argv.includes("--once");
 const workerId = process.env.READLATER_WORKER_ID || `worker-${randomUUID().slice(0, 8)}`;
 
@@ -96,11 +99,27 @@ async function processNextTranscriptionJob(provider) {
   try {
     const outcome = await advanceTranscriptionJob(job, provider);
     if (outcome.type === "complete") {
+      let resultBody = outcome.body;
+      if (transcriptionCorrectionEnabled) {
+        const correction = await correctTranscriptSegments(outcome.body.segments, {
+          hotwords: job.hotwords || [],
+          complete: providerCorrectionEnabled
+            ? (prompt, systemPrompt) => createTranscriptCorrectionCompletion(prompt, systemPrompt)
+            : undefined,
+          onProgress: ({ completed, total }) => console.log(`[readlater-worker] transcript correction chunk ${completed}/${total}`)
+        });
+        resultBody = {
+          ...outcome.body,
+          segments: correction.segments,
+          correctionMetadata: correction.metadata
+        };
+        console.log(`[readlater-worker] transcript correction ${correction.metadata.correctedSegments} segments, ${correction.metadata.rejectedSegments || 0} rejected, ${correction.metadata.failedChunks}/${correction.metadata.chunks} chunks failed`);
+      }
       await request(`/api/transcription-jobs/${job.id}/result`, {
         method: "POST",
-        body: JSON.stringify(outcome.body)
+        body: JSON.stringify(resultBody)
       });
-      console.log(`[readlater-worker] transcription done ${job.id} (${outcome.body.segments.length} segments)`);
+      console.log(`[readlater-worker] transcription done ${job.id} (${resultBody.segments.length} segments)`);
       return true;
     }
     await updateTranscriptionJob(job, outcome.body);
@@ -109,6 +128,7 @@ async function processNextTranscriptionJob(provider) {
   } catch (error) {
     const errorAttempts = Number(job.errorAttempts || 0) + 1;
     const canRetryPoll = job.stage === "poll" && error.retryable !== false && errorAttempts < 8;
+    if (!canRetryPoll) await provider.cleanupHotwords?.(job.hotwordPhraseId);
     await updateTranscriptionJob(job, canRetryPoll ? {
       status: "waiting",
       stage: "poll",
@@ -152,6 +172,17 @@ async function createProviderCompletionWithRetry(prompt, job, systemPrompt) {
     }
   }
   throw lastError;
+}
+
+async function createTranscriptCorrectionCompletion(prompt, systemPrompt) {
+  return createOpenAICompatibleChatCompletion(prompt, {
+    systemPrompt,
+    env: {
+      ...process.env,
+      OPENAI_COMPAT_MODEL: process.env.TRANSCRIPTION_CORRECTION_MODEL || process.env.OPENAI_COMPAT_MODEL,
+      OPENAI_COMPAT_TIMEOUT_MS: process.env.TRANSCRIPTION_CORRECTION_TIMEOUT_MS || "90000"
+    }
+  });
 }
 
 async function writeJobLog(job, prompt, result = {}) {
@@ -304,6 +335,7 @@ async function main() {
   if (transcriptionProvider) {
     const transcriptionConfig = tingwuConfig();
     console.log(`[readlater-worker] transcription language ${transcriptionConfig.sourceLanguage} · diarization ${transcriptionConfig.diarizationEnabled ? `enabled (${transcriptionConfig.speakerCount || "auto"})` : "disabled"}`);
+    console.log(`[readlater-worker] transcript correction ${providerCorrectionEnabled ? "AI provider enabled" : (transcriptionCorrectionEnabled ? "deterministic only" : "disabled")}`);
   }
   do {
     try {

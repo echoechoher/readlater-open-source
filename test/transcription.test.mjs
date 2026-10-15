@@ -3,10 +3,32 @@ import assert from "node:assert/strict";
 import {
   claimNextTranscriptionJob,
   createTranscriptChunks,
+  extractTranscriptionHotwords,
+  inferTranscriptionSpeakerCount,
   normalizeTranscriptSegments,
   sanitizeTranscriptSegments,
   transcriptToDocument
 } from "../lib/transcription.mjs";
+
+test("episode metadata produces deduplicated, provider-safe domain hotwords", () => {
+  const hotwords = extractTranscriptionHotwords({
+    title: "一个 Personal Agent 创业者的思考｜对谈 Ambi 创始人子皓",
+    showName: "42章经",
+    description: "从 Openclaw、Hermes，到 Muse、Instinct。54 号珍藏：莫子皓，Ambi 创始人，曾任 Plaud 合伙人。简评 Town、Grok Bot，很多产品的 Proactive 都做错了。https://example.com/form"
+  });
+  assert.deepEqual(hotwords.slice(0, 5), ["42章经", "Personal", "Agent", "Ambi", "子皓"]);
+  assert.ok(["Openclaw", "Hermes", "Muse", "Instinct", "莫子皓", "Plaud", "Town", "Grok", "Proactive"]
+    .every((word) => hotwords.includes(word)));
+  assert.equal(hotwords.filter((word) => word.toLowerCase() === "ambi").length, 1);
+  assert.ok(hotwords.every((word) => [...word].length <= 10 && /^[\p{Script=Han}A-Za-z0-9]+$/u.test(word)));
+  assert.equal(hotwords.includes("https"), false);
+});
+
+test("speaker count is fixed only when metadata strongly indicates a conversation", () => {
+  assert.equal(inferTranscriptionSpeakerCount({ title: "对谈 Ambi 创始人" }), 2);
+  assert.equal(inferTranscriptionSpeakerCount({ description: "本期嘉宾分享创业经历" }), 2);
+  assert.equal(inferTranscriptionSpeakerCount({ title: "一个人的产品复盘" }), 0);
+});
 
 test("Tingwu word output is grouped by sentence and sorted by timestamp", () => {
   const segments = normalizeTranscriptSegments({
@@ -25,6 +47,33 @@ test("Tingwu word output is grouped by sentence and sorted by timestamp", () => 
     { startMs: 100, endMs: 500, text: "第一句" },
     { startMs: 2000, endMs: 2500, text: "第二句" }
   ]);
+});
+
+test("audio event speech ranges remove recognition produced entirely in music", () => {
+  const segments = normalizeTranscriptSegments({
+    Transcription: {
+      AudioSegments: [[10000, 30000]],
+      Paragraphs: [
+        { Start: 0, End: 4000, Text: "Do something there." },
+        { Start: 12000, End: 15000, Text: "欢迎收听。" }
+      ]
+    }
+  });
+  assert.deepEqual(segments.map((segment) => segment.text), ["欢迎收听。"]);
+});
+
+test("a separated English lyric at the start of a Chinese podcast is treated as intro music", () => {
+  const segments = normalizeTranscriptSegments({
+    Transcription: {
+      AudioInfo: { Language: "cn" },
+      Paragraphs: [
+        { Start: 2000, End: 4100, Text: "Do something." },
+        { Start: 4100, End: 5000, Text: "there." },
+        { Start: 19880, End: 22984, Text: "欢迎收听今天的节目。" }
+      ]
+    }
+  });
+  assert.deepEqual(segments.map((segment) => segment.text), ["欢迎收听今天的节目。"]);
 });
 test("transcript sanitizer clamps timestamps, drops empty text, and limits untrusted fields", () => {
   assert.deepEqual(sanitizeTranscriptSegments([
